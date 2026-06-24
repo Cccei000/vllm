@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+import vllm.envs as envs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -34,10 +35,30 @@ def _tilelang_hc_prenorm_gemm(
         hc_prenorm_gemm_tilelang,
     )
 
-    assert out.shape[0] == n_splits
+    n_splits = out.shape[0]
     assert sqrsum.shape[0] == n_splits
     assert x.shape[1] == hc_mult * hidden_size
     assert x.shape[1] % n_splits == 0
+
+    from vllm.model_executor.kernels.mhc.autotune import (
+        get_hc_prenorm_gemm_config,
+    )
+
+    autotune = get_hc_prenorm_gemm_config(x.shape[0], n_splits)
+    if autotune is not None:
+        kernel_type, cfg = autotune
+        if kernel_type == "block_m":
+            hc_prenorm_gemm_block_m_tilelang(
+                x, fn, out, sqrsum, hidden_size, hc_mult, fn.shape[0],
+                cfg["n_thr"], cfg["tile_n"], cfg["block_m"],
+            )
+        else:
+            hc_prenorm_gemm_tilelang(
+                x, fn, out, sqrsum, hidden_size, hc_mult, fn.shape[0],
+                cfg["n_thr"], cfg["tile_n"], n_splits,
+            )
+        return
+
     assert (x.shape[1] // n_splits) % n_thr == 0
     use_default_config = tile_n == 12 and n_thr == 512
     if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
@@ -131,7 +152,6 @@ def mhc_pre_tilelang(
         mhc_pre_big_fuse_tilelang,
         mhc_pre_big_fuse_with_norm_tilelang,
     )
-    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
     from vllm.utils.math_utils import cdiv
 
     assert residual.dtype == torch.bfloat16
@@ -162,9 +182,73 @@ def mhc_pre_tilelang(
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
 
-    from vllm.utils.deep_gemm import is_deep_gemm_supported
+    from vllm.model_executor.kernels.mhc.autotune import get_mhc_pre_config
 
-    use_deep_gemm = is_deep_gemm_supported()
+    autotune_cfg = get_mhc_pre_config(num_tokens)
+    if autotune_cfg is not None:
+        n_splits = autotune_cfg["n_splits"]
+        big_fuse_n_thr = autotune_cfg.get("big_fuse_n_thr")
+        big_fuse_h_blk = autotune_cfg.get("big_fuse_h_blk")
+        big_fuse_n_stages = autotune_cfg.get("big_fuse_n_stages")
+
+        post_mix = torch.empty(
+            num_tokens, hc_mult, dtype=torch.float32, device=residual.device
+        )
+        comb_mix = torch.empty(
+            num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
+        )
+        layer_input = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16,
+            device=residual.device,
+        )
+        gemm_out_mul = torch.empty(
+            n_splits, num_tokens, hc_mult3, dtype=torch.float32,
+            device=residual.device,
+        )
+        gemm_out_sqrsum = torch.empty(
+            n_splits, num_tokens, dtype=torch.float32,
+            device=residual.device,
+        )
+
+        residual_2d = residual_flat.view(num_tokens, hc_mult * hidden_size)
+        _tilelang_hc_prenorm_gemm(
+            residual_2d, fn, gemm_out_mul, gemm_out_sqrsum,
+            hidden_size, hc_mult,
+        )
+
+        if norm_weight is None:
+            mhc_pre_big_fuse_tilelang(
+                gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base,
+                residual_flat, post_mix, comb_mix, layer_input,
+                hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+                hc_post_mult_value, sinkhorn_repeat, n_splits, hc_mult,
+            )
+        else:
+            bf_kwargs: dict = {}
+            if big_fuse_n_thr is not None:
+                bf_kwargs["n_thr"] = big_fuse_n_thr
+            if big_fuse_h_blk is not None:
+                bf_kwargs["h_blk"] = big_fuse_h_blk
+            if big_fuse_n_stages is not None:
+                bf_kwargs["n_stages"] = big_fuse_n_stages
+            mhc_pre_big_fuse_with_norm_tilelang(
+                gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base,
+                residual_flat, post_mix, comb_mix, layer_input,
+                norm_weight, hidden_size, rms_eps, hc_pre_eps,
+                hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+                norm_eps, n_splits, hc_mult, -1,
+                **bf_kwargs,
+            )
+
+        return (
+            post_mix.view(*outer_shape, hc_mult, 1),
+            comb_mix.view(*outer_shape, hc_mult, hc_mult),
+            layer_input.view(*outer_shape, hidden_size),
+        )
+
+    from vllm.utils.deep_gemm import is_deep_gemm_supported, tf32_hc_prenorm_gemm
+
+    use_deep_gemm = is_deep_gemm_supported() and envs.VLLM_MHC_USE_DEEP_GEMM
     if use_deep_gemm:
         # these numbers are from deepgemm kernel impl
         block_k = 64
@@ -306,20 +390,30 @@ def mhc_post_tilelang(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    from vllm.model_executor.kernels.mhc.autotune import get_mhc_post_config
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         mhc_post_tilelang as _mhc_post_kernel,
     )
 
     out = torch.empty_like(residual)
-    _mhc_post_kernel(
-        comb_res_mix,
-        residual,
-        post_layer_mix.squeeze(-1),
-        x,
-        out,
-        residual.shape[-2],
-        residual.shape[-1],
-    )
+    num_tokens = residual.shape[0]
+    autotune_cfg = get_mhc_post_config(num_tokens)
+    if autotune_cfg is not None:
+        _mhc_post_kernel(
+            comb_res_mix, residual, post_layer_mix.squeeze(-1), x, out,
+            residual.shape[-2], residual.shape[-1],
+            autotune_cfg["n_thr"], autotune_cfg["h_blk"],
+        )
+    else:
+        _mhc_post_kernel(
+            comb_res_mix,
+            residual,
+            post_layer_mix.squeeze(-1),
+            x,
+            out,
+            residual.shape[-2],
+            residual.shape[-1],
+        )
     return out
 
 
@@ -396,18 +490,112 @@ def mhc_fused_post_pre_tilelang(
         if not norm_weight.is_contiguous():
             norm_weight = norm_weight.contiguous()
 
-    assert n_splits in (1, 2, 4, 8)
-    assert hidden_size % n_splits == 0
-
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
     x_flat = x.view(num_tokens, hidden_size)
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
+    from vllm.model_executor.kernels.mhc.autotune import get_mhc_fused_post_pre_config
+
+    autotune_cfg = get_mhc_fused_post_pre_config(num_tokens)
+    if autotune_cfg is not None:
+        n_splits = autotune_cfg["n_splits"]
+        use_fused = autotune_cfg["use_fused"]
+        big_fuse_n_thr = autotune_cfg.get("big_fuse_n_thr")
+        big_fuse_h_blk = autotune_cfg.get("big_fuse_h_blk")
+        big_fuse_n_stages = autotune_cfg.get("big_fuse_n_stages")
+        assert n_splits in (1, 2, 4, 8)
+        assert hidden_size % n_splits == 0
+
+        gemm_out_mul = torch.empty(
+            n_splits, num_tokens, hc_mult3,
+            dtype=torch.float32, device=residual.device,
+        )
+        gemm_out_sqrsum = torch.empty(
+            n_splits, num_tokens,
+            dtype=torch.float32, device=residual.device,
+        )
+        residual_cur = torch.empty_like(residual_flat)
+        post_mix_cur = torch.empty(
+            num_tokens, hc_mult,
+            dtype=torch.float32, device=residual.device,
+        )
+        comb_mix_cur = torch.empty(
+            num_tokens, hc_mult2,
+            dtype=torch.float32, device=residual.device,
+        )
+        layer_input_cur = torch.empty(
+            num_tokens, hidden_size,
+            dtype=torch.bfloat16, device=residual.device,
+        )
+
+        if use_fused:
+            fused_cfg = autotune_cfg["fused_config"]
+            mhc_fused_tilelang(
+                comb_res_mix_flat, residual_flat, post_layer_mix_flat,
+                x_flat, fn.view(hc_mult3, hc_mult, hidden_size),
+                gemm_out_mul, gemm_out_sqrsum, residual_cur,
+                hc_mult, hidden_size, hc_mult3,
+                n_thr=fused_cfg["n_thr"],
+                tile_n=fused_cfg["tile_n"],
+                n_splits=n_splits,
+            )
+        else:
+            post_cfg = autotune_cfg["post_config"]
+            mhc_post_tilelang(
+                comb_res_mix_flat, residual_flat, post_layer_mix_flat,
+                x_flat, residual_cur,
+                hc_mult, hidden_size,
+                post_cfg["n_thr"], post_cfg["h_blk"],
+            )
+
+            residual_cur_2d = residual_cur.view(
+                num_tokens, hc_mult * hidden_size
+            )
+            _tilelang_hc_prenorm_gemm(
+                residual_cur_2d, fn, gemm_out_mul, gemm_out_sqrsum,
+                hidden_size, hc_mult,
+            )
+
+        if norm_weight is None:
+            mhc_pre_big_fuse_tilelang(
+                gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base,
+                residual_cur, post_mix_cur, comb_mix_cur,
+                layer_input_cur, hidden_size, rms_eps, hc_pre_eps,
+                hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+                n_splits, hc_mult,
+            )
+        else:
+            bf_kwargs: dict = {}
+            if big_fuse_n_thr is not None:
+                bf_kwargs["n_thr"] = big_fuse_n_thr
+            if big_fuse_h_blk is not None:
+                bf_kwargs["h_blk"] = big_fuse_h_blk
+            if big_fuse_n_stages is not None:
+                bf_kwargs["n_stages"] = big_fuse_n_stages
+            mhc_pre_big_fuse_with_norm_tilelang(
+                gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base,
+                residual_cur, post_mix_cur, comb_mix_cur,
+                layer_input_cur, norm_weight, hidden_size, rms_eps,
+                hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+                sinkhorn_repeat, norm_eps, n_splits, hc_mult, -1,
+                **bf_kwargs,
+            )
+
+        return (
+            residual_cur.view(*outer_shape, hc_mult, hidden_size),
+            post_mix_cur.view(*outer_shape, hc_mult, 1),
+            comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
+            layer_input_cur.view(*outer_shape, hidden_size),
+        )
+
+    assert n_splits in (1, 2, 4, 8)
+    assert hidden_size % n_splits == 0
+
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
-    use_deep_gemm = is_deep_gemm_supported()
+    use_deep_gemm = is_deep_gemm_supported() and envs.VLLM_MHC_USE_DEEP_GEMM
     use_small_fma = num_tokens <= 16
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
@@ -625,19 +813,30 @@ def hc_head_fused_kernel_tilelang(
     )
     if num_tokens == 0:
         return out
+    from vllm.model_executor.kernels.mhc.autotune import get_hc_head_fused_config
     from vllm.model_executor.kernels.mhc.tilelang_kernels import hc_head_fuse_tilelang
 
-    hc_head_fuse_tilelang(
-        hs_flat,
-        fn,
-        hc_scale,
-        hc_base,
-        out,
-        hidden_size,
-        rms_eps,
-        hc_eps,
-        hc_mult,
-    )
+    autotune_cfg = get_hc_head_fused_config(num_tokens)
+    if autotune_cfg is not None:
+        hc_head_fuse_tilelang(
+            hs_flat, fn, hc_scale, hc_base, out,
+            hidden_size, rms_eps, hc_eps, hc_mult,
+            n_thr=autotune_cfg["n_thr"],
+            h_blk=autotune_cfg["h_blk"],
+            n_stages=autotune_cfg["n_stages"],
+        )
+    else:
+        hc_head_fuse_tilelang(
+            hs_flat,
+            fn,
+            hc_scale,
+            hc_base,
+            out,
+            hidden_size,
+            rms_eps,
+            hc_eps,
+            hc_mult,
+        )
     return out
 
 

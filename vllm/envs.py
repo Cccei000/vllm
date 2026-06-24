@@ -174,6 +174,7 @@ if TYPE_CHECKING:
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
     VLLM_MOE_USE_DEEP_GEMM: bool = True
+    VLLM_MHC_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
@@ -1423,6 +1424,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
     "VLLM_MOE_USE_DEEP_GEMM": lambda: bool(
         int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))
+    ),
+    "VLLM_MHC_USE_DEEP_GEMM": lambda: bool(
+        int(os.getenv("VLLM_MHC_USE_DEEP_GEMM", "1"))
     ),
     # Whether to use E8M0 scaling when DeepGEMM is used on Blackwell GPUs.
     "VLLM_USE_DEEP_GEMM_E8M0": lambda: bool(

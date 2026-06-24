@@ -20,6 +20,7 @@ if TYPE_CHECKING or current_platform.is_cuda_alike():
         )
     import tilelang
     import tilelang.language as T
+    tilelang.disable_cache()
 else:
     tilelang = None  # type: ignore[assignment]
     T = None  # type: ignore[assignment]
@@ -214,12 +215,15 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     n_splits: int = 16,
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
+    n_thr: int = 96,
+    h_blk: int = 1024,
+    n_stages: int = 2,
 ):
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
     if gemm_last_dim < 0:
         gemm_last_dim = hc_mult3
-    hidden_block = math.gcd(1024, hidden_size)
+    hidden_block = math.gcd(h_blk, hidden_size)
 
     gemm_out_mul: T.Tensor[[n_splits, num_tokens, gemm_last_dim], T.float32]  # type: ignore[no-redef, valid-type]
     gemm_out_sqrsum: T.Tensor[[n_splits, num_tokens], T.float32]  # type: ignore[no-redef, valid-type]
@@ -231,7 +235,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]  # type: ignore[no-redef, valid-type]
     norm_weight: T.Tensor[[hidden_size], T.bfloat16]  # type: ignore[no-redef, valid-type]
 
-    with T.Kernel(num_tokens, threads=96) as i:
+    with T.Kernel(num_tokens, threads=n_thr) as i:
         rms = T.alloc_fragment(1, T.float32)
         mixes = T.alloc_fragment(hc_mult3, T.float32)
         T.clear(mixes)
@@ -309,7 +313,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             sumsq_per_pos = T.alloc_fragment(hidden_block, T.float32)
             T.clear(sumsq_per_pos)
 
-            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
+            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=n_stages):
                 xs = T.alloc_shared((hc_mult, hidden_block), T.bfloat16)
                 xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
                 T.copy(residual[i, 0, i0_h * hidden_block], xs)
@@ -333,7 +337,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             rsqrt_norm[0] = T.rsqrt(sumsq[0] / hidden_size + norm_eps)
 
             # Pass 2: scale by rsqrt * norm_weight and write the result to HBM.
-            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
+            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=n_stages):
                 w_shared = T.alloc_shared(hidden_block, T.bfloat16)
                 w_local = T.alloc_fragment(hidden_block, T.float32)
                 T.copy(norm_weight[i0_h * hidden_block], w_shared)
@@ -727,6 +731,7 @@ def hc_head_fuse_tilelang(
     hc_mult: int = 4,
     n_thr: int = 128,
     h_blk: int = 1024,
+    n_stages: int = 2,
 ):
     """Two-pass fused kernel for hc_head.
 
@@ -792,7 +797,7 @@ def hc_head_fuse_tilelang(
         # ------------------------------------------------------------------
         # Pass 2 – apply_mix: pipelined weighted sum over residual channels
         # ------------------------------------------------------------------
-        for i0_h in T.Pipelined(n_h, num_stages=2):
+        for i0_h in T.Pipelined(n_h, num_stages=n_stages):
             xs = T.alloc_shared((hc_mult, h_block), T.bfloat16)
             xl = T.alloc_fragment((hc_mult, h_block), T.float32)
             T.copy(residual[i, 0, i0_h * h_block], xs, disable_tma=True)
